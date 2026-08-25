@@ -38,6 +38,11 @@ pub fn run() {
             commands::repos::relocate_repo,
             commands::git::check_git,
             commands::git::get_repo_status,
+            commands::git::get_diff,
+            commands::git::stage_paths,
+            commands::git::unstage_paths,
+            commands::git::commit,
+            commands::git::push,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

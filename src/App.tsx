@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { RepoSidebar } from "./components/RepoSidebar";
+import { CommitTab } from "./components/tabs/CommitTab";
 import { useRepoList } from "./hooks/useRepoList";
 import "./App.css";
 
@@ -33,7 +34,23 @@ function App() {
       <main className="app-main">
         {error ? <p className="app-error">{error}</p> : null}
         {selected ? (
-          <p className="app-placeholder">{selected.entry.name}</p>
+          selected.valid ? (
+            <div className="repo-workspace">
+              <nav className="repo-tabs">
+                <span className="repo-tab active">Commit</span>
+              </nav>
+              <CommitTab
+                path={selected.entry.path}
+                status={selected.status}
+                onChanged={async () => {
+                  setError(null);
+                  await refresh();
+                }}
+              />
+            </div>
+          ) : (
+            <p className="app-placeholder">路径失效，请重新定位</p>
+          )
         ) : (
           <p className="app-placeholder">选择一个仓库</p>
         )}

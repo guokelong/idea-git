@@ -25,7 +25,7 @@ function isStaged(change: FileChange): boolean {
   return change.indexStatus !== " " && change.indexStatus !== "?";
 }
 
-function useStagedDiff(change: FileChange): boolean {
+function shouldShowStagedDiff(change: FileChange): boolean {
   const worktreeDirty =
     change.worktreeStatus !== " " && change.worktreeStatus !== "?";
   return isStaged(change) && !worktreeDirty;
@@ -75,7 +75,7 @@ export function CommitTab({ path, status, onChanged }: CommitTabProps) {
   async function loadDiff(change: FileChange) {
     setSelectedFile(change.path);
     try {
-      const text = await getDiff(path, change.path, useStagedDiff(change));
+      const text = await getDiff(path, change.path, shouldShowStagedDiff(change));
       setDiff(text);
       setError(null);
     } catch (err) {

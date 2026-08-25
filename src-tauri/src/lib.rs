@@ -1,4 +1,5 @@
 mod error;
+mod git_parse;
 mod git_runner;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/

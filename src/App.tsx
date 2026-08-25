@@ -1,50 +1,57 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useState } from "react";
+import { listRepos } from "./api/repos";
+import { RepoSidebar } from "./components/RepoSidebar";
+import type { RepoListItem } from "./types";
 import "./App.css";
 
 function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+  const [items, setItems] = useState<RepoListItem[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+  const refresh = useCallback(async () => {
+    console.info("refresh repos enter");
+    const next = await listRepos();
+    setItems(next);
+    setSelectedId((current) => {
+      if (current && next.some((item) => item.entry.id === current)) {
+        return current;
+      }
+      return null;
+    });
+    console.info("refresh repos exit count=", next.length);
+  }, []);
+
+  useEffect(() => {
+    refresh().catch((err) => {
+      console.warn("listRepos failed", err);
+      setError(typeof err === "string" ? err : err instanceof Error ? err.message : String(err));
+    });
+  }, [refresh]);
+
+  const selected = items.find((item) => item.entry.id === selectedId) ?? null;
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
+    <div className="app-shell">
+      <RepoSidebar
+        items={items}
+        selectedId={selectedId}
+        onSelect={setSelectedId}
+        onChanged={async () => {
+          setError(null);
+          await refresh();
         }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+        onError={setError}
+      />
+      <main className="app-main">
+        {error ? <p className="app-error">{error}</p> : null}
+        {selected ? (
+          <p className="app-placeholder">{selected.entry.name}</p>
+        ) : (
+          <p className="app-placeholder">选择一个仓库</p>
+        )}
+      </main>
+    </div>
   );
 }
 

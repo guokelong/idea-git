@@ -1,33 +1,20 @@
-import { useCallback, useEffect, useState } from "react";
-import { listRepos } from "./api/repos";
+import { useEffect, useState } from "react";
 import { RepoSidebar } from "./components/RepoSidebar";
-import type { RepoListItem } from "./types";
+import { useRepoList } from "./hooks/useRepoList";
 import "./App.css";
 
 function App() {
-  const [items, setItems] = useState<RepoListItem[]>([]);
+  const { items, error, setError, refresh } = useRepoList();
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
-    console.info("refresh repos enter");
-    const next = await listRepos();
-    setItems(next);
+  useEffect(() => {
     setSelectedId((current) => {
-      if (current && next.some((item) => item.entry.id === current)) {
+      if (current && items.some((item) => item.entry.id === current)) {
         return current;
       }
       return null;
     });
-    console.info("refresh repos exit count=", next.length);
-  }, []);
-
-  useEffect(() => {
-    refresh().catch((err) => {
-      console.warn("listRepos failed", err);
-      setError(typeof err === "string" ? err : err instanceof Error ? err.message : String(err));
-    });
-  }, [refresh]);
+  }, [items]);
 
   const selected = items.find((item) => item.entry.id === selectedId) ?? null;
 

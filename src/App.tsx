@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
 import { RepoSidebar } from "./components/RepoSidebar";
+import { BranchesTab } from "./components/tabs/BranchesTab";
 import { CommitTab } from "./components/tabs/CommitTab";
 import { LogTab } from "./components/tabs/LogTab";
 import { useRepoList } from "./hooks/useRepoList";
 import "./App.css";
 
-type WorkspaceTab = "commit" | "log";
+type WorkspaceTab = "commit" | "log" | "branches";
 
 function App() {
   const { items, error, setError, refresh } = useRepoList();
@@ -55,6 +56,13 @@ function App() {
                 >
                   Log
                 </button>
+                <button
+                  type="button"
+                  className={tab === "branches" ? "repo-tab active" : "repo-tab"}
+                  onClick={() => setTab("branches")}
+                >
+                  Branches
+                </button>
               </nav>
               {tab === "commit" ? (
                 <CommitTab
@@ -65,10 +73,18 @@ function App() {
                     await refresh();
                   }}
                 />
-              ) : (
+              ) : tab === "log" ? (
                 <LogTab
                   path={selected.entry.path}
                   currentBranch={selected.status?.branch ?? null}
+                />
+              ) : (
+                <BranchesTab
+                  path={selected.entry.path}
+                  onChanged={async () => {
+                    setError(null);
+                    await refresh();
+                  }}
                 />
               )}
             </div>

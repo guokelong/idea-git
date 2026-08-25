@@ -31,6 +31,100 @@ pub struct CommitRow {
     pub refs: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchRow {
+    pub name: String,
+    pub is_remote: bool,
+    pub is_current: bool,
+    pub upstream: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+}
+
+/// Parses `git for-each-ref --format=%(refname)%09%(HEAD)%09%(upstream:short)%09%(upstream:track)`.
+pub fn parse_branches(stdout: &str) -> Result<Vec<BranchRow>, AppError> {
+    let mut rows = Vec::new();
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(row) = parse_branch_ref_line(line)? {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+fn parse_branch_ref_line(line: &str) -> Result<Option<BranchRow>, AppError> {
+    let mut parts = line.splitn(4, '\t');
+    let refname = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::Message(format!("invalid branch line: {line}")))?;
+    let head = parts.next().unwrap_or("");
+    let upstream_raw = parts.next().unwrap_or("");
+    let track = parts.next().unwrap_or("");
+
+    let (name, is_remote) = if let Some(local) = refname.strip_prefix("refs/heads/") {
+        if local.is_empty() {
+            return Ok(None);
+        }
+        (local.to_string(), false)
+    } else if let Some(remote) = refname.strip_prefix("refs/remotes/") {
+        if remote.is_empty() || remote.ends_with("/HEAD") || remote == "HEAD" {
+            return Ok(None);
+        }
+        (remote.to_string(), true)
+    } else {
+        return Ok(None);
+    };
+
+    let (ahead, behind) = parse_track(track)?;
+    let upstream = if upstream_raw.is_empty() {
+        None
+    } else {
+        Some(upstream_raw.to_string())
+    };
+
+    Ok(Some(BranchRow {
+        name,
+        is_remote,
+        is_current: head == "*",
+        upstream,
+        ahead,
+        behind,
+    }))
+}
+
+fn parse_track(track: &str) -> Result<(u32, u32), AppError> {
+    let inner = track
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    if inner.is_empty() || inner == "gone" {
+        return Ok((0, 0));
+    }
+    let mut ahead = 0u32;
+    let mut behind = 0u32;
+    for segment in inner.split(',') {
+        let segment = segment.trim();
+        if let Some(n) = segment.strip_prefix("ahead ") {
+            ahead = n
+                .trim()
+                .parse()
+                .map_err(|_| AppError::Message(format!("invalid ahead count: {segment}")))?;
+        } else if let Some(n) = segment.strip_prefix("behind ") {
+            behind = n
+                .trim()
+                .parse()
+                .map_err(|_| AppError::Message(format!("invalid behind count: {segment}")))?;
+        }
+    }
+    Ok((ahead, behind))
+}
+
 /// Parses `git log --format=%H%x09%h%x09%s%x09%an%x09%aI%x09%D` (no graph chars).
 pub fn parse_log(stdout: &str) -> Result<Vec<CommitRow>, AppError> {
     let mut rows = Vec::new();
@@ -127,29 +221,10 @@ fn parse_branch_line(rest: &str) -> Result<(String, Option<String>, u32, u32), A
         None => (branch_part.to_string(), None),
     };
 
-    let mut ahead = 0u32;
-    let mut behind = 0u32;
-
-    if let Some(bracket) = bracket {
-        let inner = bracket
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .trim();
-        for segment in inner.split(',') {
-            let segment = segment.trim();
-            if let Some(n) = segment.strip_prefix("ahead ") {
-                ahead = n
-                    .trim()
-                    .parse()
-                    .map_err(|_| AppError::Message(format!("invalid ahead count: {segment}")))?;
-            } else if let Some(n) = segment.strip_prefix("behind ") {
-                behind = n
-                    .trim()
-                    .parse()
-                    .map_err(|_| AppError::Message(format!("invalid behind count: {segment}")))?;
-            }
-        }
-    }
+    let (ahead, behind) = match bracket {
+        Some(value) => parse_track(value)?,
+        None => (0, 0),
+    };
 
     Ok((branch, upstream, ahead, behind))
 }
@@ -288,5 +363,61 @@ bbb\t222\ttwo\tB\t2026-01-02T00:00:00+08:00\torigin/main
         assert_eq!(rows[0].short_hash, "111");
         assert_eq!(rows[1].short_hash, "222");
         assert_eq!(rows[1].refs, "origin/main");
+    }
+
+    #[test]
+    fn parses_local_current_with_upstream_ahead_behind() {
+        let raw = "refs/heads/main\t*\torigin/main\t[ahead 2, behind 1]\n";
+        let rows = parse_branches(raw).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "main");
+        assert!(!rows[0].is_remote);
+        assert!(rows[0].is_current);
+        assert_eq!(rows[0].upstream, Some("origin/main".into()));
+        assert_eq!(rows[0].ahead, 2);
+        assert_eq!(rows[0].behind, 1);
+    }
+
+    #[test]
+    fn parses_local_without_upstream_and_skips_remote_head() {
+        let raw = "\
+refs/heads/feature\t\t\t
+refs/remotes/origin/HEAD\t\t\t
+refs/remotes/origin/main\t\t\t
+";
+        let rows = parse_branches(raw).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            BranchRow {
+                name: "feature".into(),
+                is_remote: false,
+                is_current: false,
+                upstream: None,
+                ahead: 0,
+                behind: 0,
+            }
+        );
+        assert_eq!(rows[1].name, "origin/main");
+        assert!(rows[1].is_remote);
+        assert!(!rows[1].is_current);
+        assert_eq!(rows[1].upstream, None);
+    }
+
+    #[test]
+    fn parses_branch_track_ahead_only_behind_only_and_gone() {
+        let raw = "\
+refs/heads/dev\t\torigin/dev\t[ahead 3]
+refs/heads/old\t\torigin/old\t[behind 5]
+refs/heads/gone\t\torigin/gone\t[gone]
+";
+        let rows = parse_branches(raw).unwrap();
+        assert_eq!(rows[0].ahead, 3);
+        assert_eq!(rows[0].behind, 0);
+        assert_eq!(rows[1].ahead, 0);
+        assert_eq!(rows[1].behind, 5);
+        assert_eq!(rows[2].upstream, Some("origin/gone".into()));
+        assert_eq!(rows[2].ahead, 0);
+        assert_eq!(rows[2].behind, 0);
     }
 }

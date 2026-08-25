@@ -4,7 +4,9 @@ use std::time::Duration;
 use tauri::State;
 
 use crate::error::AppError;
-use crate::git_parse::{parse_log, parse_status_porcelain, CommitRow, RepoStatus};
+use crate::git_parse::{
+    parse_branches, parse_log, parse_status_porcelain, BranchRow, CommitRow, RepoStatus,
+};
 use crate::git_runner::GitRunner;
 
 pub(crate) async fn check_git_available(runner: &GitRunner) -> Result<bool, AppError> {
@@ -196,6 +198,68 @@ pub(crate) async fn get_commit_diff_inner(
     Ok(out.stdout)
 }
 
+const BRANCH_FORMAT: &str = "%(refname)%09%(HEAD)%09%(upstream:short)%09%(upstream:track)";
+
+pub(crate) async fn list_branches_inner(
+    path: &str,
+    runner: &GitRunner,
+) -> Result<Vec<BranchRow>, AppError> {
+    let format_arg = format!("--format={BRANCH_FORMAT}");
+    let out = run_checked(
+        runner,
+        path,
+        &[
+            "for-each-ref",
+            &format_arg,
+            "refs/heads",
+            "refs/remotes",
+        ],
+        Duration::from_secs(15),
+    )
+    .await?;
+    parse_branches(&out.stdout)
+}
+
+pub(crate) async fn checkout_branch_inner(
+    path: &str,
+    name: &str,
+    runner: &GitRunner,
+) -> Result<(), AppError> {
+    run_checked(runner, path, &["checkout", name], Duration::from_secs(30)).await?;
+    Ok(())
+}
+
+pub(crate) async fn create_branch_inner(
+    path: &str,
+    name: &str,
+    checkout: bool,
+    runner: &GitRunner,
+) -> Result<(), AppError> {
+    if checkout {
+        run_checked(
+            runner,
+            path,
+            &["checkout", "-b", name],
+            Duration::from_secs(30),
+        )
+        .await?;
+    } else {
+        run_checked(runner, path, &["branch", name], Duration::from_secs(30)).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn delete_branch_inner(
+    path: &str,
+    name: &str,
+    force: bool,
+    runner: &GitRunner,
+) -> Result<(), AppError> {
+    let flag = if force { "-D" } else { "-d" };
+    run_checked(runner, path, &["branch", flag, name], Duration::from_secs(30)).await?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn get_diff(
     path: String,
@@ -302,6 +366,67 @@ pub async fn get_commit_diff(
     match &result {
         Ok(diff) => log::info!("get_commit_diff exit len={}", diff.len()),
         Err(e) => log::warn!("get_commit_diff exit err={e}"),
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn list_branches(
+    path: String,
+    runner: State<'_, GitRunner>,
+) -> Result<Vec<BranchRow>, AppError> {
+    log::info!("list_branches enter path={path}");
+    let result = list_branches_inner(&path, &runner).await;
+    match &result {
+        Ok(rows) => log::info!("list_branches exit count={}", rows.len()),
+        Err(e) => log::warn!("list_branches exit err={e}"),
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn checkout_branch(
+    path: String,
+    name: String,
+    runner: State<'_, GitRunner>,
+) -> Result<(), AppError> {
+    log::info!("checkout_branch enter path={path} name={name}");
+    let result = checkout_branch_inner(&path, &name, &runner).await;
+    match &result {
+        Ok(()) => log::info!("checkout_branch exit"),
+        Err(e) => log::warn!("checkout_branch exit err={e}"),
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn create_branch(
+    path: String,
+    name: String,
+    checkout: bool,
+    runner: State<'_, GitRunner>,
+) -> Result<(), AppError> {
+    log::info!("create_branch enter path={path} name={name} checkout={checkout}");
+    let result = create_branch_inner(&path, &name, checkout, &runner).await;
+    match &result {
+        Ok(()) => log::info!("create_branch exit"),
+        Err(e) => log::warn!("create_branch exit err={e}"),
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn delete_branch(
+    path: String,
+    name: String,
+    force: bool,
+    runner: State<'_, GitRunner>,
+) -> Result<(), AppError> {
+    log::info!("delete_branch enter path={path} name={name} force={force}");
+    let result = delete_branch_inner(&path, &name, force, &runner).await;
+    match &result {
+        Ok(()) => log::info!("delete_branch exit"),
+        Err(e) => log::warn!("delete_branch exit err={e}"),
     }
     result
 }
@@ -620,5 +745,136 @@ mod tests {
         assert!(diff.contains("add hello"));
         assert!(diff.contains("hello.txt"));
         assert!(diff.contains("+hello"));
+    }
+
+    fn find_branch<'a>(rows: &'a [BranchRow], name: &str) -> &'a BranchRow {
+        rows.iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("missing branch {name}"))
+    }
+
+    #[tokio::test]
+    async fn list_branches_marks_current_main() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        init_git_repo(&repo);
+        let runner = GitRunner::new();
+        let rows = list_branches_inner(repo_path(&repo), &runner)
+            .await
+            .unwrap();
+        let main = find_branch(&rows, "main");
+        assert!(!main.is_remote);
+        assert!(main.is_current);
+        assert_eq!(main.ahead, 0);
+        assert_eq!(main.behind, 0);
+    }
+
+    #[tokio::test]
+    async fn create_checkout_and_delete_branch() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        init_git_repo(&repo);
+        let runner = GitRunner::new();
+        let path = repo_path(&repo);
+
+        create_branch_inner(path, "feature", false, &runner)
+            .await
+            .unwrap();
+        let rows = list_branches_inner(path, &runner).await.unwrap();
+        assert!(find_branch(&rows, "main").is_current);
+        assert!(!find_branch(&rows, "feature").is_current);
+
+        checkout_branch_inner(path, "feature", &runner)
+            .await
+            .unwrap();
+        let rows = list_branches_inner(path, &runner).await.unwrap();
+        assert!(find_branch(&rows, "feature").is_current);
+
+        checkout_branch_inner(path, "main", &runner).await.unwrap();
+        delete_branch_inner(path, "feature", false, &runner)
+            .await
+            .unwrap();
+        let rows = list_branches_inner(path, &runner).await.unwrap();
+        assert!(rows.iter().all(|row| row.name != "feature"));
+    }
+
+    #[tokio::test]
+    async fn create_branch_with_checkout_and_force_delete_unmerged() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        init_git_repo(&repo);
+        let runner = GitRunner::new();
+        let path = repo_path(&repo);
+
+        create_branch_inner(path, "wip", true, &runner)
+            .await
+            .unwrap();
+        std::fs::write(repo.join("wip.txt"), "wip\n").unwrap();
+        stage_paths_inner(path, &[String::from("wip.txt")], &runner)
+            .await
+            .unwrap();
+        commit_inner(path, String::from("wip commit"), false, &runner)
+            .await
+            .unwrap();
+        assert!(
+            find_branch(&list_branches_inner(path, &runner).await.unwrap(), "wip").is_current
+        );
+
+        checkout_branch_inner(path, "main", &runner).await.unwrap();
+        let err = delete_branch_inner(path, "wip", false, &runner)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::GitFailed { code, .. } if code != 0));
+
+        delete_branch_inner(path, "wip", true, &runner)
+            .await
+            .unwrap();
+        let rows = list_branches_inner(path, &runner).await.unwrap();
+        assert!(rows.iter().all(|row| row.name != "wip"));
+    }
+
+    #[tokio::test]
+    async fn list_branches_includes_remote_and_ahead() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        let bare = dir.path().join("remote.git");
+        init_git_repo(&repo);
+        let status = Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&bare)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args(["remote", "add", "origin"])
+            .arg(&bare)
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args(["push", "-u", "origin", "main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(repo.join("hello.txt"), "hello\n").unwrap();
+        let runner = GitRunner::new();
+        let path = repo_path(&repo);
+        stage_paths_inner(path, &[String::from("hello.txt")], &runner)
+            .await
+            .unwrap();
+        commit_inner(path, String::from("ahead"), false, &runner)
+            .await
+            .unwrap();
+
+        let rows = list_branches_inner(path, &runner).await.unwrap();
+        let main = find_branch(&rows, "main");
+        assert_eq!(main.upstream.as_deref(), Some("origin/main"));
+        assert_eq!(main.ahead, 1);
+        assert_eq!(main.behind, 0);
+        let remote = find_branch(&rows, "origin/main");
+        assert!(remote.is_remote);
+        assert!(!remote.is_current);
     }
 }

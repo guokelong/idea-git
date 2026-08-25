@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getCommitDiff, listCommits } from "../../api/git";
+import { getCommitDiff, listBranches, listCommits } from "../../api/git";
 import type { CommitRow } from "../../types";
 import { ErrorBanner } from "../ErrorBanner";
 
@@ -19,6 +19,9 @@ function errorMessage(err: unknown): string {
 
 export function LogTab({ path, currentBranch }: LogTabProps) {
   const [branch, setBranch] = useState(currentBranch ?? ALL_BRANCHES);
+  const [branchNames, setBranchNames] = useState<string[]>(
+    currentBranch ? [currentBranch] : [],
+  );
   const [rows, setRows] = useState<CommitRow[]>([]);
   const [selectedHash, setSelectedHash] = useState<string | null>(null);
   const [diff, setDiff] = useState("");
@@ -27,10 +30,24 @@ export function LogTab({ path, currentBranch }: LogTabProps) {
 
   useEffect(() => {
     setBranch(currentBranch ?? ALL_BRANCHES);
+    setBranchNames(currentBranch ? [currentBranch] : []);
     setSelectedHash(null);
     setDiff("");
     setRows([]);
     setError(null);
+    let cancelled = false;
+    listBranches(path)
+      .then((next) => {
+        if (cancelled) return;
+        setBranchNames(next.map((row) => row.name));
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.warn("listBranches failed", err);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [path, currentBranch]);
 
   useEffect(() => {
@@ -85,10 +102,12 @@ export function LogTab({ path, currentBranch }: LogTabProps) {
             }}
             disabled={busy}
           >
-            {currentBranch ? (
-              <option value={currentBranch}>{currentBranch}</option>
-            ) : null}
             <option value={ALL_BRANCHES}>全部</option>
+            {branchNames.map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
           </select>
         </label>
       </header>

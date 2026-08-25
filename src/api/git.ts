@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { CommitRow, RepoStatus } from "../types";
+import type { BranchRow, CommitRow, RepoStatus } from "../types";
 
 export function checkGit(): Promise<boolean> {
   console.info("checkGit enter");
@@ -99,5 +99,49 @@ export function getCommitDiff(path: string, hash: string): Promise<string> {
   return invoke<string>("get_commit_diff", { path, hash }).then((diff) => {
     console.info("getCommitDiff exit len=", diff.length);
     return diff;
+  });
+}
+
+export function listBranches(path: string): Promise<BranchRow[]> {
+  console.info("listBranches enter path=", path);
+  return invoke<BranchRow[]>("list_branches", { path }).then((rows) => {
+    console.info("listBranches exit count=", rows.length);
+    return rows;
+  });
+}
+
+export function checkoutBranch(path: string, name: string): Promise<void> {
+  console.info("checkoutBranch enter path=", path, "name=", name);
+  return invoke<void>("checkout_branch", { path, name }).then(() => {
+    console.info("checkoutBranch exit");
+  });
+}
+
+export function createBranch(
+  path: string,
+  name: string,
+  checkout: boolean,
+): Promise<void> {
+  console.info(
+    "createBranch enter path=",
+    path,
+    "name=",
+    name,
+    "checkout=",
+    checkout,
+  );
+  return invoke<void>("create_branch", { path, name, checkout }).then(() => {
+    console.info("createBranch exit");
+  });
+}
+
+export function deleteBranch(
+  path: string,
+  name: string,
+  force: boolean,
+): Promise<void> {
+  console.info("deleteBranch enter path=", path, "name=", name, "force=", force);
+  return invoke<void>("delete_branch", { path, name, force }).then(() => {
+    console.info("deleteBranch exit");
   });
 }

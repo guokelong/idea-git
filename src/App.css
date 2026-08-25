@@ -401,6 +401,84 @@ button:disabled {
   word-break: break-word;
 }
 
+.branches-tab {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.branches-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+}
+
+.branches-new-name {
+  flex: 1;
+  max-width: 280px;
+  box-sizing: border-box;
+  padding: 0.3em 0.6em;
+  border: 1px solid #d8d8d8;
+  border-radius: 6px;
+  font: inherit;
+}
+
+.branches-list {
+  list-style: none;
+  margin: 0;
+  padding: 8px 16px 16px;
+  overflow: auto;
+}
+
+.branches-empty {
+  color: #666;
+  padding: 8px 0;
+}
+
+.branches-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+
+.branches-row.current {
+  background: #dce8ff;
+}
+
+.branches-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.branches-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.branches-meta {
+  font-size: 12px;
+  line-height: 16px;
+  color: #666;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.branches-actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
 .app-placeholder {
   margin: auto;
   color: #666;
@@ -445,7 +523,9 @@ button:disabled {
   .repo-tab,
   .commit-empty,
   .log-empty,
-  .log-meta {
+  .log-meta,
+  .branches-empty,
+  .branches-meta {
     color: #bbb;
   }
 
@@ -462,8 +542,15 @@ button:disabled {
   }
 
   .commit-change.selected,
-  .log-commit.selected {
+  .log-commit.selected,
+  .branches-row.current {
     background: #2a3a5c;
+  }
+
+  .branches-new-name {
+    color: #f6f6f6;
+    background: #0f0f0f98;
+    border-color: #3a3a3a;
   }
 
   .error-banner {

@@ -22,3 +22,12 @@ export type CommitRow = {
   date: string;
   refs: string;
 };
+
+export type BranchRow = {
+  name: string;
+  isRemote: boolean;
+  isCurrent: boolean;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+};

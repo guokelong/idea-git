@@ -4,7 +4,7 @@ use std::time::Duration;
 use tauri::State;
 
 use crate::error::AppError;
-use crate::git_parse::{parse_status_porcelain, RepoStatus};
+use crate::git_parse::{parse_log, parse_status_porcelain, CommitRow, RepoStatus};
 use crate::git_runner::GitRunner;
 
 pub(crate) async fn check_git_available(runner: &GitRunner) -> Result<bool, AppError> {
@@ -162,6 +162,40 @@ pub(crate) async fn push_inner(path: &str, runner: &GitRunner) -> Result<(), App
     Ok(())
 }
 
+const LOG_FORMAT: &str = "%H%x09%h%x09%s%x09%an%x09%aI%x09%D";
+
+pub(crate) async fn list_commits_inner(
+    path: &str,
+    branch: Option<String>,
+    limit: u32,
+    runner: &GitRunner,
+) -> Result<Vec<CommitRow>, AppError> {
+    let limit_s = limit.to_string();
+    let format_arg = format!("--format={LOG_FORMAT}");
+    let mut args = vec![
+        "log".to_string(),
+        "-n".to_string(),
+        limit_s,
+        format_arg,
+    ];
+    match branch.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => args.push(name.to_string()),
+        None => args.push("--all".to_string()),
+    }
+    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = run_checked(runner, path, &args_ref, Duration::from_secs(15)).await?;
+    parse_log(&out.stdout)
+}
+
+pub(crate) async fn get_commit_diff_inner(
+    path: &str,
+    hash: &str,
+    runner: &GitRunner,
+) -> Result<String, AppError> {
+    let out = run_checked(runner, path, &["show", hash], Duration::from_secs(15)).await?;
+    Ok(out.stdout)
+}
+
 #[tauri::command]
 pub async fn get_diff(
     path: String,
@@ -234,6 +268,40 @@ pub async fn push(path: String, runner: State<'_, GitRunner>) -> Result<(), AppE
     match &result {
         Ok(()) => log::info!("push exit"),
         Err(e) => log::warn!("push exit err={e}"),
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn list_commits(
+    path: String,
+    branch: Option<String>,
+    limit: u32,
+    runner: State<'_, GitRunner>,
+) -> Result<Vec<CommitRow>, AppError> {
+    log::info!(
+        "list_commits enter path={path} branch={:?} limit={limit}",
+        branch
+    );
+    let result = list_commits_inner(&path, branch, limit, &runner).await;
+    match &result {
+        Ok(rows) => log::info!("list_commits exit count={}", rows.len()),
+        Err(e) => log::warn!("list_commits exit err={e}"),
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn get_commit_diff(
+    path: String,
+    hash: String,
+    runner: State<'_, GitRunner>,
+) -> Result<String, AppError> {
+    log::info!("get_commit_diff enter path={path} hash={hash}");
+    let result = get_commit_diff_inner(&path, &hash, &runner).await;
+    match &result {
+        Ok(diff) => log::info!("get_commit_diff exit len={}", diff.len()),
+        Err(e) => log::warn!("get_commit_diff exit err={e}"),
     }
     result
 }
@@ -477,5 +545,80 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "add hello");
+    }
+
+    #[tokio::test]
+    async fn list_commits_returns_parsed_rows() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        init_git_repo(&repo);
+        let runner = GitRunner::new();
+        let path = repo_path(&repo);
+
+        let rows = list_commits_inner(path, None, 10, &runner).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject, "init");
+        assert!(!rows[0].hash.is_empty());
+        assert!(!rows[0].short_hash.is_empty());
+        assert_eq!(rows[0].author, "test");
+        assert!(rows[0].refs.contains("HEAD") || rows[0].refs.contains("main"));
+    }
+
+    #[tokio::test]
+    async fn list_commits_filters_by_branch() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        init_git_repo(&repo);
+        let status = Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(repo.join("feat.txt"), "feat\n").unwrap();
+        let runner = GitRunner::new();
+        let path = repo_path(&repo);
+        stage_paths_inner(path, &[String::from("feat.txt")], &runner)
+            .await
+            .unwrap();
+        commit_inner(path, String::from("add feat"), false, &runner)
+            .await
+            .unwrap();
+
+        let feature = list_commits_inner(path, Some(String::from("feature")), 10, &runner)
+            .await
+            .unwrap();
+        assert_eq!(feature[0].subject, "add feat");
+        assert_eq!(feature.len(), 2);
+
+        let main = list_commits_inner(path, Some(String::from("main")), 10, &runner)
+            .await
+            .unwrap();
+        assert_eq!(main.len(), 1);
+        assert_eq!(main[0].subject, "init");
+    }
+
+    #[tokio::test]
+    async fn get_commit_diff_contains_show_output() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        init_git_repo(&repo);
+        std::fs::write(repo.join("hello.txt"), "hello\n").unwrap();
+        let runner = GitRunner::new();
+        let path = repo_path(&repo);
+        stage_paths_inner(path, &[String::from("hello.txt")], &runner)
+            .await
+            .unwrap();
+        commit_inner(path, String::from("add hello"), false, &runner)
+            .await
+            .unwrap();
+
+        let rows = list_commits_inner(path, None, 1, &runner).await.unwrap();
+        let diff = get_commit_diff_inner(path, &rows[0].hash, &runner)
+            .await
+            .unwrap();
+        assert!(diff.contains("add hello"));
+        assert!(diff.contains("hello.txt"));
+        assert!(diff.contains("+hello"));
     }
 }

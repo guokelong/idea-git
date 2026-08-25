@@ -20,6 +20,59 @@ pub struct RepoStatus {
     pub dirty: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitRow {
+    pub hash: String,
+    pub short_hash: String,
+    pub subject: String,
+    pub author: String,
+    pub date: String,
+    pub refs: String,
+}
+
+/// Parses `git log --format=%H%x09%h%x09%s%x09%an%x09%aI%x09%D` (no graph chars).
+pub fn parse_log(stdout: &str) -> Result<Vec<CommitRow>, AppError> {
+    let mut rows = Vec::new();
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        rows.push(parse_log_line(line)?);
+    }
+    Ok(rows)
+}
+
+fn parse_log_line(line: &str) -> Result<CommitRow, AppError> {
+    let mut parts = line.splitn(6, '\t');
+    let hash = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::Message(format!("invalid log line: {line}")))?;
+    let short_hash = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::Message(format!("invalid log line: {line}")))?;
+    let subject = parts
+        .next()
+        .ok_or_else(|| AppError::Message(format!("invalid log line: {line}")))?;
+    let author = parts
+        .next()
+        .ok_or_else(|| AppError::Message(format!("invalid log line: {line}")))?;
+    let date = parts
+        .next()
+        .ok_or_else(|| AppError::Message(format!("invalid log line: {line}")))?;
+    let refs = parts.next().unwrap_or("");
+    Ok(CommitRow {
+        hash: hash.to_string(),
+        short_hash: short_hash.to_string(),
+        subject: subject.to_string(),
+        author: author.to_string(),
+        date: date.to_string(),
+        refs: refs.to_string(),
+    })
+}
+
 /// Parses output of `git status --porcelain=v1 -b`.
 pub fn parse_status_porcelain(stdout: &str) -> Result<RepoStatus, AppError> {
     let mut branch = String::new();
@@ -203,5 +256,37 @@ UU conflict.txt
         let s = parse_status_porcelain(behind_only).unwrap();
         assert_eq!(s.ahead, 0);
         assert_eq!(s.behind, 5);
+    }
+
+    #[test]
+    fn parses_log_lines() {
+        let raw = "abc\tdef123\tmsg\tAnn\t2026-01-01T00:00:00+08:00\tHEAD -> main\n";
+        let rows = parse_log(raw).unwrap();
+        assert_eq!(rows[0].hash, "abc");
+        assert_eq!(rows[0].short_hash, "def123");
+        assert_eq!(rows[0].subject, "msg");
+        assert_eq!(rows[0].author, "Ann");
+        assert_eq!(rows[0].date, "2026-01-01T00:00:00+08:00");
+        assert_eq!(rows[0].refs, "HEAD -> main");
+    }
+
+    #[test]
+    fn parses_log_line_without_refs() {
+        let raw = "abc\tdef123\tmsg\tAnn\t2026-01-01T00:00:00+08:00\n";
+        let rows = parse_log(raw).unwrap();
+        assert_eq!(rows[0].refs, "");
+    }
+
+    #[test]
+    fn parses_multiple_log_lines_skips_blank() {
+        let raw = "\
+aaa\t111\tone\tA\t2026-01-01T00:00:00+08:00\tHEAD -> main
+bbb\t222\ttwo\tB\t2026-01-02T00:00:00+08:00\torigin/main
+";
+        let rows = parse_log(raw).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].short_hash, "111");
+        assert_eq!(rows[1].short_hash, "222");
+        assert_eq!(rows[1].refs, "origin/main");
     }
 }

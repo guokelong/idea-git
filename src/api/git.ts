@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { RepoStatus } from "../types";
+import type { CommitRow, RepoStatus } from "../types";
 
 export function checkGit(): Promise<boolean> {
   console.info("checkGit enter");
@@ -70,5 +70,34 @@ export function push(path: string): Promise<void> {
   console.info("push enter path=", path);
   return invoke<void>("push", { path }).then(() => {
     console.info("push exit");
+  });
+}
+
+export function listCommits(
+  path: string,
+  branch: string | null,
+  limit: number,
+): Promise<CommitRow[]> {
+  console.info(
+    "listCommits enter path=",
+    path,
+    "branch=",
+    branch,
+    "limit=",
+    limit,
+  );
+  return invoke<CommitRow[]>("list_commits", { path, branch, limit }).then(
+    (rows) => {
+      console.info("listCommits exit count=", rows.length);
+      return rows;
+    },
+  );
+}
+
+export function getCommitDiff(path: string, hash: string): Promise<string> {
+  console.info("getCommitDiff enter path=", path, "hash=", hash);
+  return invoke<string>("get_commit_diff", { path, hash }).then((diff) => {
+    console.info("getCommitDiff exit len=", diff.length);
+    return diff;
   });
 }

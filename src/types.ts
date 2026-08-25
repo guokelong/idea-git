@@ -13,3 +13,12 @@ export type RepoStatus = {
   hasConflicts: boolean;
   dirty: boolean;
 };
+
+export type CommitRow = {
+  hash: string;
+  shortHash: string;
+  subject: string;
+  author: string;
+  date: string;
+  refs: string;
+};

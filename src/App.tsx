@@ -1,12 +1,16 @@
 import { useEffect, useState } from "react";
 import { RepoSidebar } from "./components/RepoSidebar";
 import { CommitTab } from "./components/tabs/CommitTab";
+import { LogTab } from "./components/tabs/LogTab";
 import { useRepoList } from "./hooks/useRepoList";
 import "./App.css";
+
+type WorkspaceTab = "commit" | "log";
 
 function App() {
   const { items, error, setError, refresh } = useRepoList();
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [tab, setTab] = useState<WorkspaceTab>("commit");
 
   useEffect(() => {
     setSelectedId((current) => {
@@ -37,16 +41,36 @@ function App() {
           selected.valid ? (
             <div className="repo-workspace">
               <nav className="repo-tabs">
-                <span className="repo-tab active">Commit</span>
+                <button
+                  type="button"
+                  className={tab === "commit" ? "repo-tab active" : "repo-tab"}
+                  onClick={() => setTab("commit")}
+                >
+                  Commit
+                </button>
+                <button
+                  type="button"
+                  className={tab === "log" ? "repo-tab active" : "repo-tab"}
+                  onClick={() => setTab("log")}
+                >
+                  Log
+                </button>
               </nav>
-              <CommitTab
-                path={selected.entry.path}
-                status={selected.status}
-                onChanged={async () => {
-                  setError(null);
-                  await refresh();
-                }}
-              />
+              {tab === "commit" ? (
+                <CommitTab
+                  path={selected.entry.path}
+                  status={selected.status}
+                  onChanged={async () => {
+                    setError(null);
+                    await refresh();
+                  }}
+                />
+              ) : (
+                <LogTab
+                  path={selected.entry.path}
+                  currentBranch={selected.status?.branch ?? null}
+                />
+              )}
             </div>
           ) : (
             <p className="app-placeholder">路径失效，请重新定位</p>

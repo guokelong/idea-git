@@ -1,9 +1,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { addRepo, relocateRepo, removeRepo } from "../api/repos";
-import {
-  formatRepoStatusLine,
-  type RepoOverviewItem,
-} from "../hooks/useRepoList";
+import type { RepoOverviewItem } from "../hooks/useRepoList";
+import { formatRepoSubtitle } from "../lib/formatRepoSubtitle";
 
 type RepoSidebarProps = {
   items: RepoOverviewItem[];
@@ -123,7 +121,7 @@ export function RepoSidebar({
                   <span className="repo-status-line">
                     {item.valid
                       ? item.status
-                        ? formatRepoStatusLine(item.status)
+                        ? formatRepoSubtitle(item.status)
                         : "状态未知"
                       : "路径失效"}
                   </span>

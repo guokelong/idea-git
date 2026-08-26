@@ -72,6 +72,9 @@ export function RepoSidebar({
           <button type="button" onClick={handleAdd}>
             添加
           </button>
+          <button type="button" onClick={() => void onChanged()}>
+            刷新
+          </button>
           <button
             type="button"
             onClick={() => {

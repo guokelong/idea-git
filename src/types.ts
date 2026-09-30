@@ -31,3 +31,17 @@ export type BranchRow = {
   ahead: number;
   behind: number;
 };
+
+export type PushPreview = {
+  branch: string;
+  remote: string;
+  upstream: string | null;
+  newBranch: boolean;
+  commits: CommitRow[];
+};
+
+export type CommitFileChange = {
+  status: string;
+  path: string;
+  oldPath: string | null;
+};

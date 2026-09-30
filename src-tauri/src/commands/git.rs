@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -100,6 +101,88 @@ pub(crate) async fn get_file_diff(
     Ok(out.stdout)
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffSides {
+    pub before: String,
+    pub after: String,
+    pub binary: bool,
+}
+
+async fn show_blob(
+    runner: &GitRunner,
+    repo: &str,
+    spec: &str,
+) -> Result<Option<String>, AppError> {
+    let out = runner
+        .run(
+            Path::new(repo),
+            &["show", spec],
+            Duration::from_secs(15),
+        )
+        .await?;
+    if out.code != 0 {
+        return Ok(None);
+    }
+    if out.stdout.contains('\0') {
+        return Ok(None);
+    }
+    Ok(Some(out.stdout))
+}
+
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.contains(&0)
+}
+
+pub(crate) async fn get_diff_sides_inner(
+    path: &str,
+    file: &str,
+    staged: bool,
+    runner: &GitRunner,
+) -> Result<DiffSides, AppError> {
+    let head_spec = format!("HEAD:{file}");
+    let before = show_blob(runner, path, &head_spec)
+        .await?
+        .unwrap_or_default();
+
+    let after = if staged {
+        let index_spec = format!(":{file}");
+        show_blob(runner, path, &index_spec)
+            .await?
+            .unwrap_or_default()
+    } else {
+        let worktree = Path::new(path).join(file);
+        if !worktree.exists() {
+            String::new()
+        } else {
+            let bytes = fs::read(&worktree).map_err(|e| AppError::Io(e.to_string()))?;
+            if looks_binary(&bytes) {
+                return Ok(DiffSides {
+                    before,
+                    after: String::new(),
+                    binary: true,
+                });
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    };
+
+    let binary = before.contains('\0') || after.contains('\0');
+    if binary {
+        return Ok(DiffSides {
+            before: String::new(),
+            after: String::new(),
+            binary: true,
+        });
+    }
+
+    Ok(DiffSides {
+        before,
+        after,
+        binary: false,
+    })
+}
+
 pub(crate) async fn stage_paths_inner(
     path: &str,
     paths: &[String],
@@ -160,11 +243,85 @@ pub(crate) async fn commit_inner(
 }
 
 pub(crate) async fn push_inner(path: &str, runner: &GitRunner) -> Result<(), AppError> {
-    run_checked(runner, path, &["push"], Duration::from_secs(120)).await?;
+    let status = fetch_repo_status(path, runner).await?;
+    if status.upstream.is_some() {
+        log::info!("push with existing upstream branch={}", status.branch);
+        run_checked(runner, path, &["push"], Duration::from_secs(120)).await?;
+    } else {
+        let branch = status.branch.trim();
+        if branch.is_empty() || branch == "HEAD" || branch.starts_with("HEAD (") {
+            return Err(AppError::Message(
+                "当前处于分离 HEAD，无法设置上游并推送".into(),
+            ));
+        }
+        log::info!("push set-upstream origin branch={branch}");
+        run_checked(
+            runner,
+            path,
+            &["push", "--set-upstream", "origin", branch],
+            Duration::from_secs(120),
+        )
+        .await?;
+    }
     Ok(())
 }
 
 const LOG_FORMAT: &str = "%H%x09%h%x09%s%x09%an%x09%aI%x09%D";
+const PUSH_PREVIEW_LIMIT: u32 = 100;
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushPreview {
+    pub branch: String,
+    pub remote: String,
+    pub upstream: Option<String>,
+    pub new_branch: bool,
+    pub commits: Vec<CommitRow>,
+}
+
+fn remote_from_upstream(upstream: &str) -> String {
+    match upstream.split_once('/') {
+        Some((remote, _)) if !remote.is_empty() => remote.to_string(),
+        _ => String::from("origin"),
+    }
+}
+
+pub(crate) async fn list_commits_to_push_inner(
+    path: &str,
+    runner: &GitRunner,
+) -> Result<PushPreview, AppError> {
+    let status = fetch_repo_status(path, runner).await?;
+    let branch = status.branch.clone();
+    let limit_s = PUSH_PREVIEW_LIMIT.to_string();
+    let format_arg = format!("--format={LOG_FORMAT}");
+
+    let (remote, new_branch, range_or_rev) = match status.upstream.as_deref() {
+        Some(upstream) => (
+            remote_from_upstream(upstream),
+            false,
+            format!("{upstream}..HEAD"),
+        ),
+        None => (String::from("origin"), true, String::from("HEAD")),
+    };
+
+    let args = [
+        "log",
+        "-n",
+        limit_s.as_str(),
+        format_arg.as_str(),
+        range_or_rev.as_str(),
+    ];
+    let out = run_checked(runner, path, &args, Duration::from_secs(15)).await?;
+    let commits = parse_log(&out.stdout)?;
+
+    Ok(PushPreview {
+        branch,
+        remote,
+        upstream: status.upstream,
+        new_branch,
+        commits,
+    })
+}
 
 pub(crate) async fn list_commits_inner(
     path: &str,
@@ -198,6 +355,121 @@ pub(crate) async fn get_commit_diff_inner(
     Ok(out.stdout)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitFileChange {
+    pub status: String,
+    pub path: String,
+    pub old_path: Option<String>,
+}
+
+/// Parses `git diff-tree --name-status` lines (`M\tpath`, `R100\told\tnew`).
+pub(crate) fn parse_name_status(stdout: &str) -> Result<Vec<CommitFileChange>, AppError> {
+    let mut rows = Vec::new();
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let status_raw = parts
+            .next()
+            .ok_or_else(|| AppError::Message(format!("invalid name-status line: {line}")))?;
+        let status_code = status_raw
+            .chars()
+            .next()
+            .ok_or_else(|| AppError::Message(format!("invalid name-status line: {line}")))?;
+        let status = status_code.to_string();
+        match status_code {
+            'R' | 'C' => {
+                let old_path = parts
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| AppError::Message(format!("invalid name-status line: {line}")))?
+                    .to_string();
+                let path = parts
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| AppError::Message(format!("invalid name-status line: {line}")))?
+                    .to_string();
+                rows.push(CommitFileChange {
+                    status,
+                    path,
+                    old_path: Some(old_path),
+                });
+            }
+            _ => {
+                let path = parts
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| AppError::Message(format!("invalid name-status line: {line}")))?
+                    .to_string();
+                rows.push(CommitFileChange {
+                    status,
+                    path,
+                    old_path: None,
+                });
+            }
+        }
+    }
+    Ok(rows)
+}
+
+pub(crate) async fn list_commit_files_inner(
+    path: &str,
+    hash: &str,
+    runner: &GitRunner,
+) -> Result<Vec<CommitFileChange>, AppError> {
+    let out = run_checked(
+        runner,
+        path,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            "--root",
+            hash,
+        ],
+        Duration::from_secs(15),
+    )
+    .await?;
+    parse_name_status(&out.stdout)
+}
+
+pub(crate) async fn get_commit_file_sides_inner(
+    path: &str,
+    hash: &str,
+    file: &str,
+    old_path: Option<&str>,
+    runner: &GitRunner,
+) -> Result<DiffSides, AppError> {
+    let before_path = old_path.unwrap_or(file);
+    let before_spec = format!("{hash}^:{before_path}");
+    let after_spec = format!("{hash}:{file}");
+
+    let before = show_blob(runner, path, &before_spec)
+        .await?
+        .unwrap_or_default();
+    let after = show_blob(runner, path, &after_spec)
+        .await?
+        .unwrap_or_default();
+
+    let binary = before.contains('\0') || after.contains('\0');
+    if binary {
+        return Ok(DiffSides {
+            before: String::new(),
+            after: String::new(),
+            binary: true,
+        });
+    }
+
+    Ok(DiffSides {
+        before,
+        after,
+        binary: false,
+    })
+}
+
 const BRANCH_FORMAT: &str = "%(refname)%09%(HEAD)%09%(upstream:short)%09%(upstream:track)";
 
 pub(crate) async fn list_branches_inner(
@@ -229,22 +501,73 @@ pub(crate) async fn checkout_branch_inner(
     Ok(())
 }
 
+/// `origin/feature/x` → `feature/x`
+pub(crate) fn local_name_from_remote(remote_ref: &str) -> String {
+    match remote_ref.split_once('/') {
+        Some((_, rest)) if !rest.is_empty() => rest.to_string(),
+        _ => remote_ref.to_string(),
+    }
+}
+
+async fn local_branch_exists(
+    path: &str,
+    name: &str,
+    runner: &GitRunner,
+) -> Result<bool, AppError> {
+    let rows = list_branches_inner(path, runner).await?;
+    Ok(rows.iter().any(|r| !r.is_remote && r.name == name))
+}
+
+/// Checkout a remote-tracking branch (IDEA-style):
+/// if a local branch with the short name exists, switch to it;
+/// otherwise create a local tracking branch via `checkout --track`.
+pub(crate) async fn checkout_remote_branch_inner(
+    path: &str,
+    remote_ref: &str,
+    runner: &GitRunner,
+) -> Result<(), AppError> {
+    let local = local_name_from_remote(remote_ref);
+    if local_branch_exists(path, &local, runner).await? {
+        return checkout_branch_inner(path, &local, runner).await;
+    }
+    run_checked(
+        runner,
+        path,
+        &["checkout", "--track", remote_ref],
+        Duration::from_secs(30),
+    )
+    .await?;
+    Ok(())
+}
+
 pub(crate) async fn create_branch_inner(
     path: &str,
     name: &str,
     checkout: bool,
     runner: &GitRunner,
 ) -> Result<(), AppError> {
+    create_branch_from_inner(path, name, None, checkout, runner).await
+}
+
+pub(crate) async fn create_branch_from_inner(
+    path: &str,
+    name: &str,
+    start_point: Option<&str>,
+    checkout: bool,
+    runner: &GitRunner,
+) -> Result<(), AppError> {
     if checkout {
-        run_checked(
-            runner,
-            path,
-            &["checkout", "-b", name],
-            Duration::from_secs(30),
-        )
-        .await?;
+        let mut args = vec!["checkout", "-b", name];
+        if let Some(start) = start_point {
+            args.push(start);
+        }
+        run_checked(runner, path, &args, Duration::from_secs(30)).await?;
     } else {
-        run_checked(runner, path, &["branch", name], Duration::from_secs(30)).await?;
+        let mut args = vec!["branch", name];
+        if let Some(start) = start_point {
+            args.push(start);
+        }
+        run_checked(runner, path, &args, Duration::from_secs(30)).await?;
     }
     Ok(())
 }
@@ -260,6 +583,38 @@ pub(crate) async fn delete_branch_inner(
     Ok(())
 }
 
+pub(crate) fn add_to_gitignore_inner(path: &str, pattern: &str) -> Result<(), AppError> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Message("ignore 规则不能为空".into()));
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        return Err(AppError::Message("ignore 规则不能包含换行".into()));
+    }
+
+    let gitignore = Path::new(path).join(".gitignore");
+    let existing = if gitignore.exists() {
+        fs::read_to_string(&gitignore).map_err(|e| AppError::Io(e.to_string()))?
+    } else {
+        String::new()
+    };
+
+    for line in existing.lines() {
+        if line == trimmed {
+            return Ok(());
+        }
+    }
+
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(trimmed);
+    content.push('\n');
+    fs::write(&gitignore, content).map_err(|e| AppError::Io(e.to_string()))?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn get_diff(
     path: String,
@@ -272,6 +627,27 @@ pub async fn get_diff(
     match &result {
         Ok(diff) => log::info!("get_diff exit len={}", diff.len()),
         Err(e) => log::warn!("get_diff exit err={e}"),
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn get_diff_sides(
+    path: String,
+    file: String,
+    staged: bool,
+    runner: State<'_, GitRunner>,
+) -> Result<DiffSides, AppError> {
+    log::info!("get_diff_sides enter path={path} file={file} staged={staged}");
+    let result = get_diff_sides_inner(&path, &file, staged, &runner).await;
+    match &result {
+        Ok(sides) => log::info!(
+            "get_diff_sides exit before_len={} after_len={} binary={}",
+            sides.before.len(),
+            sides.after.len(),
+            sides.binary
+        ),
+        Err(e) => log::warn!("get_diff_sides exit err={e}"),
     }
     result
 }
@@ -337,6 +713,25 @@ pub async fn push(path: String, runner: State<'_, GitRunner>) -> Result<(), AppE
 }
 
 #[tauri::command]
+pub async fn list_commits_to_push(
+    path: String,
+    runner: State<'_, GitRunner>,
+) -> Result<PushPreview, AppError> {
+    log::info!("list_commits_to_push enter path={path}");
+    let result = list_commits_to_push_inner(&path, &runner).await;
+    match &result {
+        Ok(preview) => log::info!(
+            "list_commits_to_push exit branch={} new_branch={} count={}",
+            preview.branch,
+            preview.new_branch,
+            preview.commits.len()
+        ),
+        Err(e) => log::warn!("list_commits_to_push exit err={e}"),
+    }
+    result
+}
+
+#[tauri::command]
 pub async fn list_commits(
     path: String,
     branch: Option<String>,
@@ -371,6 +766,46 @@ pub async fn get_commit_diff(
 }
 
 #[tauri::command]
+pub async fn list_commit_files(
+    path: String,
+    hash: String,
+    runner: State<'_, GitRunner>,
+) -> Result<Vec<CommitFileChange>, AppError> {
+    log::info!("list_commit_files enter path={path} hash={hash}");
+    let result = list_commit_files_inner(&path, &hash, &runner).await;
+    match &result {
+        Ok(rows) => log::info!("list_commit_files exit count={}", rows.len()),
+        Err(e) => log::warn!("list_commit_files exit err={e}"),
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn get_commit_file_sides(
+    path: String,
+    hash: String,
+    file: String,
+    old_path: Option<String>,
+    runner: State<'_, GitRunner>,
+) -> Result<DiffSides, AppError> {
+    log::info!(
+        "get_commit_file_sides enter path={path} hash={hash} file={file} old_path={old_path:?}"
+    );
+    let result =
+        get_commit_file_sides_inner(&path, &hash, &file, old_path.as_deref(), &runner).await;
+    match &result {
+        Ok(sides) => log::info!(
+            "get_commit_file_sides exit before_len={} after_len={} binary={}",
+            sides.before.len(),
+            sides.after.len(),
+            sides.binary
+        ),
+        Err(e) => log::warn!("get_commit_file_sides exit err={e}"),
+    }
+    result
+}
+
+#[tauri::command]
 pub async fn list_branches(
     path: String,
     runner: State<'_, GitRunner>,
@@ -400,6 +835,21 @@ pub async fn checkout_branch(
 }
 
 #[tauri::command]
+pub async fn checkout_remote_branch(
+    path: String,
+    remote_ref: String,
+    runner: State<'_, GitRunner>,
+) -> Result<(), AppError> {
+    log::info!("checkout_remote_branch enter path={path} remote_ref={remote_ref}");
+    let result = checkout_remote_branch_inner(&path, &remote_ref, &runner).await;
+    match &result {
+        Ok(()) => log::info!("checkout_remote_branch exit"),
+        Err(e) => log::warn!("checkout_remote_branch exit err={e}"),
+    }
+    result
+}
+
+#[tauri::command]
 pub async fn create_branch(
     path: String,
     name: String,
@@ -416,6 +866,26 @@ pub async fn create_branch(
 }
 
 #[tauri::command]
+pub async fn create_branch_from(
+    path: String,
+    name: String,
+    start_point: String,
+    checkout: bool,
+    runner: State<'_, GitRunner>,
+) -> Result<(), AppError> {
+    log::info!(
+        "create_branch_from enter path={path} name={name} start={start_point} checkout={checkout}"
+    );
+    let result =
+        create_branch_from_inner(&path, &name, Some(&start_point), checkout, &runner).await;
+    match &result {
+        Ok(()) => log::info!("create_branch_from exit"),
+        Err(e) => log::warn!("create_branch_from exit err={e}"),
+    }
+    result
+}
+
+#[tauri::command]
 pub async fn delete_branch(
     path: String,
     name: String,
@@ -427,6 +897,17 @@ pub async fn delete_branch(
     match &result {
         Ok(()) => log::info!("delete_branch exit"),
         Err(e) => log::warn!("delete_branch exit err={e}"),
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn add_to_gitignore(path: String, pattern: String) -> Result<(), AppError> {
+    log::info!("add_to_gitignore enter path={path} pattern={pattern}");
+    let result = add_to_gitignore_inner(&path, &pattern);
+    match &result {
+        Ok(()) => log::info!("add_to_gitignore exit"),
+        Err(e) => log::warn!("add_to_gitignore exit err={e}"),
     }
     result
 }
@@ -482,6 +963,38 @@ mod tests {
         let runner = GitRunner::new();
         let available = check_git_available(&runner).await.unwrap();
         assert!(available);
+    }
+
+    #[test]
+    fn add_to_gitignore_appends_and_skips_duplicate() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        init_git_repo(&repo);
+        let path = repo_path(&repo);
+
+        add_to_gitignore_inner(path, "tmp.log").unwrap();
+        add_to_gitignore_inner(path, "tmp.log").unwrap();
+        add_to_gitignore_inner(path, "build/").unwrap();
+
+        let content = fs::read_to_string(repo.join(".gitignore")).unwrap();
+        assert_eq!(content, "tmp.log\nbuild/\n");
+    }
+
+    #[test]
+    fn add_to_gitignore_rejects_empty_and_newline() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        init_git_repo(&repo);
+        let path = repo_path(&repo);
+
+        assert!(matches!(
+            add_to_gitignore_inner(path, "  "),
+            Err(AppError::Message(_))
+        ));
+        assert!(matches!(
+            add_to_gitignore_inner(path, "a\nb"),
+            Err(AppError::Message(_))
+        ));
     }
 
     #[tokio::test]
@@ -604,6 +1117,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_diff_sides_returns_before_and_after() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        init_git_repo(&repo);
+        std::fs::write(repo.join("hello.txt"), "v1\n").unwrap();
+        let runner = GitRunner::new();
+        let path = repo_path(&repo);
+        stage_paths_inner(path, &[String::from("hello.txt")], &runner)
+            .await
+            .unwrap();
+        commit_inner(path, String::from("add hello"), false, &runner)
+            .await
+            .unwrap();
+        std::fs::write(repo.join("hello.txt"), "v2\n").unwrap();
+
+        let sides = get_diff_sides_inner(path, "hello.txt", false, &runner)
+            .await
+            .unwrap();
+        assert!(!sides.binary);
+        assert_eq!(sides.before, "v1\n");
+        assert_eq!(sides.after, "v2\n");
+    }
+
+    #[tokio::test]
     async fn unstage_paths_removes_from_index() {
         let dir = tempdir().unwrap();
         let repo = dir.path().join("demo");
@@ -670,6 +1207,165 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "add hello");
+    }
+
+    #[tokio::test]
+    async fn push_sets_upstream_when_branch_has_none() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        let bare = dir.path().join("remote.git");
+        init_git_repo(&repo);
+        let status = Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&bare)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args(["remote", "add", "origin"])
+            .arg(&bare)
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        std::fs::write(repo.join("hello.txt"), "hello\n").unwrap();
+        let runner = GitRunner::new();
+        let path = repo_path(&repo);
+        stage_paths_inner(path, &[String::from("hello.txt")], &runner)
+            .await
+            .unwrap();
+        commit_inner(path, String::from("add hello"), false, &runner)
+            .await
+            .unwrap();
+        push_inner(path, &runner).await.unwrap();
+
+        let out = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "@{u}"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "origin/feature"
+        );
+
+        let out = Command::new("git")
+            .args(["-C"])
+            .arg(&bare)
+            .args(["log", "feature", "-1", "--pretty=%s"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "add hello");
+    }
+
+    #[tokio::test]
+    async fn list_commits_to_push_returns_ahead_commits() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        let bare = dir.path().join("remote.git");
+        init_git_repo(&repo);
+        assert!(Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&bare)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["remote", "add", "origin"])
+            .arg(&bare)
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["push", "-u", "origin", "main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+
+        let runner = GitRunner::new();
+        let path = repo_path(&repo);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        stage_paths_inner(path, &[String::from("a.txt")], &runner)
+            .await
+            .unwrap();
+        commit_inner(path, String::from("ahead one"), false, &runner)
+            .await
+            .unwrap();
+
+        let preview = list_commits_to_push_inner(path, &runner).await.unwrap();
+        assert_eq!(preview.branch, "main");
+        assert_eq!(preview.remote, "origin");
+        assert_eq!(preview.upstream.as_deref(), Some("origin/main"));
+        assert!(!preview.new_branch);
+        assert_eq!(preview.commits.len(), 1);
+        assert_eq!(preview.commits[0].subject, "ahead one");
+    }
+
+    #[tokio::test]
+    async fn list_commits_to_push_empty_when_synced() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        let bare = dir.path().join("remote.git");
+        init_git_repo(&repo);
+        assert!(Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&bare)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["remote", "add", "origin"])
+            .arg(&bare)
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["push", "-u", "origin", "main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+
+        let runner = GitRunner::new();
+        let path = repo_path(&repo);
+        let preview = list_commits_to_push_inner(path, &runner).await.unwrap();
+        assert!(!preview.new_branch);
+        assert!(preview.commits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_commits_to_push_marks_new_branch() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        init_git_repo(&repo);
+        assert!(Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+
+        let runner = GitRunner::new();
+        let path = repo_path(&repo);
+        let preview = list_commits_to_push_inner(path, &runner).await.unwrap();
+        assert_eq!(preview.branch, "feature");
+        assert_eq!(preview.remote, "origin");
+        assert!(preview.upstream.is_none());
+        assert!(preview.new_branch);
+        assert!(!preview.commits.is_empty());
+        assert_eq!(preview.commits[0].subject, "init");
     }
 
     #[tokio::test]
@@ -745,6 +1441,67 @@ mod tests {
         assert!(diff.contains("add hello"));
         assert!(diff.contains("hello.txt"));
         assert!(diff.contains("+hello"));
+    }
+
+    #[test]
+    fn parse_name_status_handles_modify_add_delete_rename() {
+        let raw = "M\ta.txt\nA\tb.txt\nD\tc.txt\nR100\told.txt\tnew.txt\n";
+        let rows = parse_name_status(raw).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                CommitFileChange {
+                    status: "M".into(),
+                    path: "a.txt".into(),
+                    old_path: None,
+                },
+                CommitFileChange {
+                    status: "A".into(),
+                    path: "b.txt".into(),
+                    old_path: None,
+                },
+                CommitFileChange {
+                    status: "D".into(),
+                    path: "c.txt".into(),
+                    old_path: None,
+                },
+                CommitFileChange {
+                    status: "R".into(),
+                    path: "new.txt".into(),
+                    old_path: Some("old.txt".into()),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_commit_files_and_sides_for_added_file() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        init_git_repo(&repo);
+        std::fs::write(repo.join("hello.txt"), "hello\n").unwrap();
+        let runner = GitRunner::new();
+        let path = repo_path(&repo);
+        stage_paths_inner(path, &[String::from("hello.txt")], &runner)
+            .await
+            .unwrap();
+        commit_inner(path, String::from("add hello"), false, &runner)
+            .await
+            .unwrap();
+
+        let rows = list_commits_inner(path, None, 1, &runner).await.unwrap();
+        let hash = &rows[0].hash;
+        let files = list_commit_files_inner(path, hash, &runner).await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, "A");
+        assert_eq!(files[0].path, "hello.txt");
+
+        let sides = get_commit_file_sides_inner(path, hash, "hello.txt", None, &runner)
+            .await
+            .unwrap();
+        assert!(!sides.binary);
+        assert_eq!(sides.before, "");
+        assert_eq!(sides.after, "hello\n");
     }
 
     fn find_branch<'a>(rows: &'a [BranchRow], name: &str) -> &'a BranchRow {
@@ -831,6 +1588,109 @@ mod tests {
             .unwrap();
         let rows = list_branches_inner(path, &runner).await.unwrap();
         assert!(rows.iter().all(|row| row.name != "wip"));
+    }
+
+    #[test]
+    fn local_name_from_remote_strips_remote() {
+        assert_eq!(local_name_from_remote("origin/main"), "main");
+        assert_eq!(
+            local_name_from_remote("origin/feature/login"),
+            "feature/login"
+        );
+        assert_eq!(local_name_from_remote("main"), "main");
+    }
+
+    #[tokio::test]
+    async fn checkout_remote_creates_tracking_local() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        let bare = dir.path().join("remote.git");
+        init_git_repo(&repo);
+        let status = Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&bare)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let runner = GitRunner::new();
+        let path = repo_path(&repo);
+        run_checked(
+            &runner,
+            path,
+            &["remote", "add", "origin", bare.to_str().unwrap()],
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        create_branch_inner(path, "feature", true, &runner)
+            .await
+            .unwrap();
+        std::fs::write(repo.join("f.txt"), "f\n").unwrap();
+        stage_paths_inner(path, &[String::from("f.txt")], &runner)
+            .await
+            .unwrap();
+        commit_inner(path, String::from("feat"), false, &runner)
+            .await
+            .unwrap();
+        run_checked(
+            &runner,
+            path,
+            &["push", "-u", "origin", "feature"],
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        checkout_branch_inner(path, "main", &runner).await.unwrap();
+        // drop local feature so track checkout recreates it
+        delete_branch_inner(path, "feature", true, &runner)
+            .await
+            .unwrap();
+
+        checkout_remote_branch_inner(path, "origin/feature", &runner)
+            .await
+            .unwrap();
+        let rows = list_branches_inner(path, &runner).await.unwrap();
+        let local = find_branch(&rows, "feature");
+        assert!(local.is_current);
+        assert!(!local.is_remote);
+    }
+
+    #[tokio::test]
+    async fn create_branch_from_remote_start() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("demo");
+        let bare = dir.path().join("remote.git");
+        init_git_repo(&repo);
+        let status = Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&bare)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let runner = GitRunner::new();
+        let path = repo_path(&repo);
+        run_checked(
+            &runner,
+            path,
+            &["remote", "add", "origin", bare.to_str().unwrap()],
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        run_checked(
+            &runner,
+            path,
+            &["push", "-u", "origin", "main"],
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+
+        create_branch_from_inner(path, "from-remote", Some("origin/main"), true, &runner)
+            .await
+            .unwrap();
+        let rows = list_branches_inner(path, &runner).await.unwrap();
+        assert!(find_branch(&rows, "from-remote").is_current);
     }
 
     #[tokio::test]

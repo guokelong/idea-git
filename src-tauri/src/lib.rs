@@ -39,16 +39,23 @@ pub fn run() {
             commands::git::check_git,
             commands::git::get_repo_status,
             commands::git::get_diff,
+            commands::git::get_diff_sides,
             commands::git::stage_paths,
             commands::git::unstage_paths,
             commands::git::commit,
             commands::git::push,
+            commands::git::list_commits_to_push,
             commands::git::list_commits,
             commands::git::get_commit_diff,
+            commands::git::list_commit_files,
+            commands::git::get_commit_file_sides,
             commands::git::list_branches,
             commands::git::checkout_branch,
+            commands::git::checkout_remote_branch,
             commands::git::create_branch,
+            commands::git::create_branch_from,
             commands::git::delete_branch,
+            commands::git::add_to_gitignore,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
